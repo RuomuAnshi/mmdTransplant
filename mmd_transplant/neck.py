@@ -7,7 +7,7 @@ def distance(a, b):
     return math.sqrt(sum((x-y)**2 for x,y in zip(a,b)))
 
 
-def find_rim(points, material_faces, anchor, width, up=1):
+def find_rim(points, material_faces, anchor, width, up=1, prefer_low=False):
     """Find a closed, horizontally enclosing rim near the head joint.
 
     Work per material: UV splits are grouped geometrically, while facial
@@ -68,7 +68,7 @@ def find_rim(points, material_faces, anchor, width, up=1):
                 loop.reverse()
             candidates.append({'material':material,'points':loop,'members':[members[k] for k in loop],
                                'center':center,'score':distance(center,anchor)})
-    return min(candidates,key=lambda c:c['score']) if candidates else None
+    return min(candidates,key=(lambda c:(c['center'][up],c['score'])) if prefer_low else lambda c:c['score']) if candidates else None
 
 
 def fit_plan(points, head_faces, body_faces, anchor, width, up=1):
@@ -109,15 +109,15 @@ def fit_plan(points, head_faces, body_faces, anchor, width, up=1):
             'max_delta':max_delta,'rim_vertices':len(hp)}
 
 
-def bridge_plan(points, head_faces, body_faces, anchor, width, up=1):
+def bridge_plan(points, head_faces, body_faces, anchor, width, up=1, head_rim=None, body_rim=None, allow_equal=False):
     """Triangulate a strip between two unequal, separated neck loops.
 
     Keep both original rims fixed. A monotonic dynamic-programming path uses
     every boundary edge once, avoiding holes from nearest-vertex snapping.
     """
-    head=find_rim(points,head_faces,anchor,width,up)
-    body=find_rim(points,body_faces,anchor,width,up)
-    if not head or not body or len(head['points'])==len(body['points']):
+    head=head_rim or find_rim(points,head_faces,anchor,width,up)
+    body=body_rim or find_rim(points,body_faces,anchor,width,up)
+    if not head or not body or (not allow_equal and len(head['points'])==len(body['points'])):
         return None
     hp,bp=head['points'],body['points']
     if max(max(min(distance(a,b) for b in bp) for a in hp),

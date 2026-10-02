@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace as NS, ModuleType
 import unittest
+from copy import deepcopy
 
 package=ModuleType('mmd_transplant')
 package.__path__=[str(Path(__file__).resolve().parents[1]/'mmd_transplant')]
@@ -34,6 +35,17 @@ def fixture():
     return m
 
 
+def eye_fixture():
+    """Synthetic eye surfaces; rotation pivots can move independently."""
+    model = fixture()
+    for bone, center in ((3, 0.5), (4, -0.5)):
+        for x in (-0.1, -0.05, 0, 0.05, 0.1):
+            for y in (-0.1, -0.05, 0, 0.05, 0.1):
+                model.vertices.append(NS(co=(center+x, 2.2+y, 0),
+                    weight=NS(type=0,bones=[bone],weights=[]), additional_uvs=[]))
+    return model
+
+
 class Morph:
     def __init__(self, name, kind, offsets):
         self.name = name
@@ -44,6 +56,55 @@ class Morph:
 
 
 class CoreTests(unittest.TestCase):
+    def test_auto_scale_uses_eye_geometry_instead_of_misplaced_pivots(self):
+        head, body = eye_fixture(), eye_fixture()
+        body.bones[3].location = (0.12, 2.2, 0)
+        body.bones[4].location = (-0.12, 2.2, 0)
+        before = deepcopy([v.co for v in head.vertices])
+        plan = core.analyze(head, body, core.Options(scale=1.2))
+        self.assertAlmostEqual(plan['scale'], 1.2)
+        self.assertEqual(plan['scale_estimate']['source'], 'eye_geometry')
+        self.assertAlmostEqual(plan['scale_estimate']['bone_ratio'], 0.4)
+        self.assertTrue(plan['warnings'])
+        self.assertEqual([v.co for v in head.vertices], before)
+
+    def test_eye_geometry_preserves_uniform_scale_and_ignores_uv_duplicates(self):
+        head, body = eye_fixture(), eye_fixture()
+        for vertex in head.vertices:
+            vertex.co = tuple(x*2 for x in vertex.co)
+        for bone in head.bones:
+            bone.location = tuple(x*2 for x in bone.location)
+        # Duplicate one eye's edge as UV splits, then add a stray weighted point.
+        body.vertices.extend(deepcopy(body.vertices[6:11])*20)
+        body.vertices.append(NS(co=(1000, 1000, 1000),
+            weight=NS(type=0,bones=[3],weights=[]), additional_uvs=[]))
+        plan = core.analyze(head, body, core.Options())
+        self.assertAlmostEqual(plan['scale'], 0.5)
+        self.assertEqual(plan['scale_estimate']['source'], 'eye_geometry')
+
+    def test_eye_estimation_fallbacks_do_not_mix_measurement_types(self):
+        head, body = eye_fixture(), fixture()
+        estimate = core.estimate_scale(head, body)
+        self.assertEqual(estimate['source'], 'unchanged')
+        self.assertEqual(estimate['ratio'], 1)
+        head, body = fixture(), fixture()
+        self.assertEqual(core.estimate_scale(head, body)['source'], 'eye_bones')
+        for bone in body.bones[3:]:
+            bone.name = bone.name_e = 'unrecognized'
+        self.assertEqual(core.estimate_scale(head, body)['source'], 'unchanged')
+
+    def test_rejects_unilateral_or_implausible_eye_geometry(self):
+        model = eye_fixture()
+        for vertex in model.vertices[31:]:
+            vertex.co = (vertex.co[0], vertex.co[1]+2, vertex.co[2])
+        self.assertIsNone(core.eye_measurement(model)['geometry_span'])
+        model = eye_fixture()
+        for vertex in model.vertices[6:]:
+            vertex.co = (vertex.co[0]*20, vertex.co[1], vertex.co[2])
+        # Here the eyes remain bilateral but the surfaces collapse vertically
+        # relative to their separation, so they cannot provide a reliable size.
+        self.assertIsNone(core.eye_measurement(model)['geometry_span'])
+
     def test_preserves_body_and_maps_donor(self):
         head, body = fixture(), fixture()
         result, report = core.transplant(NS(Model=Model),head,body)

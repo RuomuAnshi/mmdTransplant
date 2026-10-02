@@ -5,7 +5,8 @@ import hashlib
 import math
 from pathlib import Path
 import shutil
-from .neck import fit_plan, bridge_plan
+from statistics import median
+from .neck import fit_plan, bridge_plan, find_rim
 
 
 class TransplantError(ValueError):
@@ -63,6 +64,132 @@ def influences(vertex):
     return zip(w.bones, weights)
 
 
+def eye_measurement(model):
+    """Measure actual weighted eye geometry, independently of control pivots.
+
+    Eye pivots can sit anywhere an author needs them for rotation. Unique
+    positions and medians avoid UV duplicates and dense highlights skewing
+    the measured centers. Only accept a plausible bilateral pair.
+    """
+    try:
+        indices = [bone_index(model, aliases=aliases) for aliases in
+                   (("左目", "eye_l", "left eye"), ("右目", "eye_r", "right eye"))]
+    except TransplantError:
+        return {"bone_span": 0.0, "geometry_span": None}
+    pivots = [model.bones[i].location for i in indices]
+    bone_span = math.dist(*pivots)
+    groups = [descendants(model, {i}) for i in indices]
+    samples = [set(), set()]
+    for vertex in model.vertices:
+        weights = list(influences(vertex))
+        point = tuple(float(x) for x in vertex.co)
+        if not all(math.isfinite(x) for x in point):
+            continue
+        for group, points in zip(groups, samples):
+            if sum(weight for bone, weight in weights if bone in group) > 0.5:
+                points.add(point)
+    result = {"bone_span": bone_span, "geometry_span": None}
+    if min(map(len, samples)) < 8:
+        return result
+    centers = [tuple(median(p[k] for p in points) for k in range(3)) for points in samples]
+    span = math.dist(*centers)
+    if (span <= 1e-6 or abs(centers[0][0] - centers[1][0]) < span * 0.9
+            or any(abs(centers[0][k] - centers[1][k]) > span * 0.25 for k in (1, 2))):
+        return result
+    # Samples must describe similarly sized eyes, not stray weighted geometry.
+    sizes = []
+    for points in samples:
+        dimensions = []
+        for k in range(3):
+            values = sorted(p[k] for p in points)
+            trim = max(1, len(values) // 10)
+            dimensions.append(values[-trim-1] - values[trim])
+        if (not span * 0.02 < dimensions[0] < span * 0.9
+                or not span * 0.02 < dimensions[1] < span or dimensions[2] > span * 1.5):
+            return result
+        sizes.append(dimensions)
+    if any(not 0.4 < a / b < 2.5 for a, b in zip(sizes[0][:2], sizes[1][:2])):
+        return result
+    result["geometry_span"] = span
+    return result
+
+
+def estimate_scale(head, body):
+    """Compare like measurements; never mix a pivot with a geometry center."""
+    measures = [eye_measurement(m) for m in (head, body)]
+    geometry = [m["geometry_span"] for m in measures]
+    bones = [m["bone_span"] for m in measures]
+    bone_ratio = bones[1] / bones[0] if min(bones) > 1e-6 else None
+    if all(value is not None for value in geometry):
+        ratio = geometry[1] / geometry[0]
+        return {"source": "eye_geometry", "ratio": ratio, "bone_ratio": bone_ratio}
+    if bone_ratio is not None:
+        # If only one side has measured eyes, its pivots still need to agree
+        # with that geometry before trusting a two-pivot fallback.
+        if any(value is not None and not 0.75 < value / bone < 1.333333
+               for value, bone in zip(geometry, bones)):
+            return {"source": "unchanged", "ratio": 1.0, "bone_ratio": bone_ratio}
+        return {"source": "eye_bones", "ratio": bone_ratio, "bone_ratio": bone_ratio}
+    return {"source": "unchanged", "ratio": 1.0, "bone_ratio": None}
+
+
+def neck_controls(model, head_index):
+    """Find the neck and coincident helper controls without naming assumptions."""
+    try:
+        neck = bone_index(model, aliases=('首', 'neck', '脖子'))
+    except TransplantError:
+        return set()
+    reference = model.bones[neck]
+    tolerance = max(1e-6, math.dist(reference.location,model.bones[head_index].location)*1e-4)
+    return {neck} | {i for i,bone in enumerate(model.bones)
+                     if bone.parent == reference.parent and math.dist(bone.location,reference.location) < tolerance}
+
+
+def complete_neck_tubes(model, head_index, selected, stats):
+    """Keep a skin tube intact when weight thresholding cuts its middle.
+
+    Require a compact neck/head-weighted surface, a closed lower rim, and
+    shared geometry with already selected head surfaces. Clothing and hair
+    do not qualify merely because they lie near the neck.
+    """
+    measurement = eye_measurement(model)
+    width = measurement['geometry_span'] or measurement['bone_span']
+    if width <= 1e-6:
+        return []
+    controls = neck_controls(model,head_index) | {head_index}
+    if len(controls) < 2:
+        return []
+    anchor = model.bones[head_index].location
+    positions = [v.co for v in model.vertices]
+    head_points = {tuple(round(float(x), 5) for x in positions[i])
+                   for face, keep in zip(model.faces, selected) if keep for i in face}
+    cursor = 0
+    changed = []
+    for stat in stats:
+        end = cursor + stat['faces']
+        fraction = stat['head_faces'] / max(1, stat['faces'])
+        if stat['mode'] == 'AUTO' and 0.05 < fraction < 0.95:
+            faces = model.faces[cursor:end]
+            ids = {i for face in faces for i in face}
+            compact = (all(math.hypot(positions[i][0]-anchor[0], positions[i][2]-anchor[2]) < width for i in ids)
+                       and all(anchor[1]-width*1.2 < positions[i][1] < anchor[1]+width*.7 for i in ids))
+            weighted = compact and all(sum(w for b, w in influences(model.vertices[i]) if b in controls) > .95 for i in ids)
+            rim = find_rim(positions, {stat['index']:faces}, anchor, width, prefer_low=True) if weighted else None
+            if rim and rim['center'][1] < anchor[1] and max(p[1] for p in rim['points'])-min(p[1] for p in rim['points']) < width*.4:
+                bottom = {tuple(round(x, 5) for x in p) for p in rim['points']}
+                # Only the upper join should connect to head skin, never the
+                # body's side of the cut. Exclude already selected tube points.
+                other = {tuple(round(float(x),5) for x in positions[i]) for j,face in enumerate(model.faces)
+                         if not cursor <= j < end and selected[j] for i in face}
+                joins = (head_points & other & {tuple(round(float(x),5) for x in positions[i]) for i in ids}) - bottom
+                if len(joins) >= 8:
+                    selected[cursor:end] = [True] * stat['faces']
+                    stat['head_faces'] = stat['faces']
+                    changed.append(stat['index'])
+        cursor = end
+    return changed
+
+
 def select_head(model, head, threshold, overrides=None, extra=()):
     roots = {head}
     for name in extra:
@@ -93,6 +220,7 @@ def analyze(head, body, options):
     bi = bone_index(body, options.body_head_bone)
     hb, hf, hs = select_head(head, hi, options.threshold, options.head_materials, options.extra_head_bones)
     bb, bf, bs = select_head(body, bi, options.threshold, options.body_materials)
+    neck_tubes = complete_neck_tubes(head, hi, hf, hs) if options.fit_neck else []
     transition_adjustments=[]
     if options.fit_neck:
         # A handful of blended neck triangles must not punch a hole into an
@@ -119,19 +247,16 @@ def analyze(head, body, options):
         raise TransplantError("身体所有面都被识别为头部，请检查骨骼或材质覆盖设置。")
     scale = options.scale
     warnings = []
+    scale_estimate = {"source": "manual", "ratio": 1.0, "bone_ratio": None}
     if options.auto_scale:
-        def eye_span(m):
-            try:
-                left = m.bones[bone_index(m, aliases=("左目", "eye_l", "left eye"))].location
-                right = m.bones[bone_index(m, aliases=("右目", "eye_r", "right eye"))].location
-                return math.dist(left, right)
-            except TransplantError:
-                return 0
-        hs_eye, bs_eye = eye_span(head), eye_span(body)
-        if min(hs_eye, bs_eye) > 1e-6:
-            scale *= bs_eye / hs_eye
-        else:
-            warnings.append("未找到有效左右眼骨骼，自动比例回退为 1；请手动调节。")
+        scale_estimate = estimate_scale(head, body)
+        scale *= scale_estimate["ratio"]
+        if scale_estimate["source"] == "unchanged":
+            warnings.append("缺少可靠的眼部几何或眼骨骼比例，自动比例保持 1；请检查并手动调节。")
+        elif scale_estimate["source"] == "eye_geometry" and scale_estimate["bone_ratio"] is not None:
+            disagreement = scale_estimate["ratio"] / scale_estimate["bone_ratio"]
+            if not 0.8 < disagreement < 1.25:
+                warnings.append("眼骨骼布局与眼部几何不一致，已按实际眼部几何估算比例；请检查头身效果。")
     if not math.isfinite(scale) or scale <= 0 or not all(math.isfinite(v) for v in options.offset):
         raise TransplantError("比例必须大于零，偏移必须是有限数值。")
     for label, m, bones in (("头部", head, hb), ("身体", body, bb)):
@@ -140,7 +265,8 @@ def analyze(head, body, options):
             warnings.append(f"{label}有未挂在头骨骼下的疑似头发骨骼：{', '.join(escaped[:6])}；检查材质范围。")
     return {"head_index": hi, "body_head_index": bi, "head_bones": hb, "body_head_bones": bb,
             "head_faces": hf, "body_head_faces": bf, "head_materials": hs, "body_materials": bs,
-            "scale": scale, "warnings": warnings,"neck_transition_adjustments":transition_adjustments}
+            "scale": scale, "scale_estimate": scale_estimate, "warnings": warnings,
+            "neck_tube_materials": neck_tubes, "neck_transition_adjustments":transition_adjustments}
 
 
 def _ancestor(model, index, mapping, fallback):
@@ -188,7 +314,7 @@ def transplant(pmx, head, body, options=None):
     out = pmx.Model()
     out.name = f"{head.name} × {body.name}"
     out.name_e = f"{head.name_e} on {body.name_e}"
-    out.comment = f"MMD Transplant 0.3.0\n头部来源：{head.filepath}\n身体来源：{body.filepath}\n\n{head.comment}\n\n{body.comment}"
+    out.comment = f"MMD Transplant 0.3.1\n头部来源：{head.filepath}\n身体来源：{body.filepath}\n\n{head.comment}\n\n{body.comment}"
     out.comment_e = head.comment_e + "\n" + body.comment_e
     keep_body = set(range(len(body.bones))) - (bb - {bi})
     bm = {old: new for new, old in enumerate(sorted(keep_body))}
@@ -206,6 +332,13 @@ def transplant(pmx, head, body, options=None):
                 hm[i] = names[b.name]
             elif b.name_e and b.name_e.casefold() in names_e:
                 hm[i] = names_e[b.name_e.casefold()]
+    # Some exporters duplicate the neck control solely for skin weighting.
+    # Its coincident bind position/parent identifies the same body control.
+    for i in neck_controls(head,hi):
+        if i not in hm:
+            source_neck = bone_index(head,aliases=('首','neck','脖子'))
+            if source_neck in hm:
+                hm[i] = hm[source_neck]
     used_names = set(names)
     for i in sorted(keep_body):
         b = deepcopy(body.bones[i])
@@ -400,8 +533,9 @@ def transplant(pmx, head, body, options=None):
         try:
             left = out.bones[bone_index(out, aliases=("左目", "eye_l", "left eye"))].location
             right = out.bones[bone_index(out, aliases=("右目", "eye_r", "right eye"))].location
-            width = math.dist(left, right)
-            neck_report = fit_neck_pmx(pmx, out, set(maps[1][1].values()), set(maps[0][1].values()), target_anchor, width)
+            width = eye_measurement(out)['geometry_span'] or math.dist(left, right)
+            repair_materials = {maps[1][1][i] for i in plan['neck_tube_materials'] if i in maps[1][1]}
+            neck_report = fit_neck_pmx(pmx, out, set(maps[1][1].values()), set(maps[0][1].values()), target_anchor, width, repair_materials)
         except TransplantError:
             neck_report = {"status": "skipped", "reason": "找不到眼骨骼，无法可靠估计颈部搜索范围"}
         if neck_report["status"] == "skipped":
@@ -415,7 +549,7 @@ def transplant(pmx, head, body, options=None):
     return out, report
 
 
-def fit_neck_pmx(pmx, model, head_materials, body_materials, anchor, width):
+def fit_neck_pmx(pmx, model, head_materials, body_materials, anchor, width, repair_materials=()):
     head_faces, body_faces = {}, {}
     cursor = 0
     for i, material in enumerate(model.materials):
@@ -425,6 +559,11 @@ def fit_neck_pmx(pmx, model, head_materials, body_materials, anchor, width):
             head_faces[i] = faces
         elif i in body_materials:
             body_faces[i] = faces
+    if repair_materials:
+        repaired = repair_neck_overlap(pmx, model, head_faces, body_faces, anchor, width, repair_materials)
+        if repaired is not None:
+            return repaired
+        return {"status":"skipped", "reason":"已保留完整颈部皮肤，但无法确认安全修剪和连接范围；请检查材质覆盖或手动处理"}
     plan = fit_plan([v.co for v in model.vertices], head_faces, body_faces, anchor, width)
     if plan is None:
         bridge=bridge_plan([v.co for v in model.vertices],head_faces,body_faces,anchor,width)
@@ -483,6 +622,59 @@ def fit_neck_pmx(pmx, model, head_materials, body_materials, anchor, width):
     return {"status":"fitted","rim_vertices":plan['rim_vertices'],"affected_vertices":len(changes),
             "max_displacement":plan['max_delta'],"head_material":model.materials[plan['head_rim']['material']].name,
             "body_material":model.materials[plan['body_rim']['material']].name}
+
+
+def repair_neck_overlap(pmx, model, head_faces, body_faces, anchor, width, repair_materials):
+    """Replace a threshold-cut tube join with two safe cuts and a skin strip."""
+    from .neck_clip import clip_material
+    points = [v.co for v in model.vertices]
+    head = find_rim(points, {i:head_faces[i] for i in repair_materials if i in head_faces}, anchor, width, prefer_low=True)
+    body = find_rim(points, body_faces, anchor, width)
+    if not head or not body:
+        return None
+    if min(p[1] for p in head['points']) > max(p[1] for p in body['points']) + width*1e-5:
+        plan = bridge_plan(points, head_faces, body_faces, anchor, width,
+                           head_rim=head, body_rim=body, allow_equal=True)
+        return bridge_neck_pmx(pmx,model,plan) if plan else None
+    head_plane = max(p[1] for p in head['points']) + width*.02
+    body_plane = min(p[1] for p in body['points']) - width*.02
+    if not 0 < head_plane-body_plane < width*.5:
+        return None
+    if any(math.hypot(points[i][0]-anchor[0],points[i][2]-anchor[2]) > width*1.2
+           for face in body_faces[body['material']] for i in face if points[i][1] > body_plane):
+        return None
+    # Never trim into the jaw's attachment to the tube, even if the chin
+    # itself protrudes below this plane on another material.
+    tube_ids = {i for face in head_faces[head['material']] for i in face}
+    tube_keys = {tuple(round(float(x),5) for x in points[i]) for i in tube_ids}
+    joins = [points[i][1] for material,faces in head_faces.items() if material != head['material']
+             for face in faces for i in face if tuple(round(float(x),5) for x in points[i]) in tube_keys]
+    if not joins or head_plane >= min(joins)-width*.01:
+        return None
+    candidate = deepcopy(model)
+    cuts = [clip_material(pmx,candidate,head['material'],head_plane,True),
+            clip_material(pmx,candidate,body['material'],body_plane,False)]
+    updated_head,updated_body = {},{}
+    cursor = 0
+    for i,material in enumerate(candidate.materials):
+        end = cursor+material.vertex_count//3
+        if i in head_faces:updated_head[i]=candidate.faces[cursor:end]
+        if i in body_faces:updated_body[i]=candidate.faces[cursor:end]
+        cursor=end
+    points = [v.co for v in candidate.vertices]
+    head = find_rim(points,{head['material']:updated_head[head['material']]},anchor,width,prefer_low=True)
+    body = find_rim(points,{body['material']:updated_body[body['material']]},anchor,width)
+    plan = bridge_plan(points,updated_head,updated_body,anchor,width,
+                       head_rim=head,body_rim=body,allow_equal=True) if head and body else None
+    if plan is None:
+        return None
+    result = bridge_neck_pmx(pmx,candidate,plan)
+    validate(candidate)
+    for attr in ('vertices','faces','materials','morphs'):
+        setattr(model,attr,getattr(candidate,attr))
+    result['trimmed_neck'] = True
+    result['interpolated_vertices'] = sum(len(cut['created_indices']) for cut in cuts)
+    return result
 
 
 def bridge_neck_pmx(pmx, model, plan):

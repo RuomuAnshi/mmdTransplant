@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MMD 自动换头 / MMD Transplant",
     "author": "RuomuAnshi",
-    "version": (0, 3, 0),
+    "version": (0, 3, 1),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > MMD 换头",
     "description": "PMX 自动换头：保留身体骨架、头部表情、头发物理，并支持材质覆盖",
@@ -71,7 +71,7 @@ class MMDT_Settings(bpy.types.PropertyGroup):
     body_head_bone: StringProperty(name="身源的头骨骼", description="留空自动识别 頭 / head / 头")
     extra_bones: StringProperty(name="额外头部骨骼", description="额外子树根骨骼，英文逗号分隔；用于不挂在頭下面的头发")
     threshold: FloatProperty(name="头部权重阈值", min=0.01, max=1.0, default=0.5)
-    auto_scale: BoolProperty(name="按眼距自动匹配比例", default=True)
+    auto_scale: BoolProperty(name="自动匹配头部比例", description="优先按实际眼部几何匹配；眼骨骼位置不可靠时提示检查", default=True)
     scale: FloatProperty(name="头部比例微调", min=0.01, max=10.0, default=1.0)
     offset: FloatVectorProperty(name="位置微调", description="PMX 单位：X 左右，Y 上下，Z 前后；1 PMX 单位导入后默认 0.08 Blender 单位", size=3, default=(0, 0, 0), step=1, precision=3)
     physics: BoolProperty(name="保留新头部刚体和关节", default=True)
