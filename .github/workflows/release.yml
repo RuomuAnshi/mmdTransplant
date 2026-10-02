@@ -1,0 +1,58 @@
+name: Publish plugin release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify public source and version
+        run: |
+          python3 scripts/check_public_tree.py
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+
+          manifest = tomllib.loads(Path('mmd_transplant/blender_manifest.toml').read_text())
+          if os.environ['GITHUB_REF_NAME'] != 'v' + manifest['version']:
+              raise SystemExit('Release tag must match the plugin version')
+          PY
+
+      - name: Run synthetic tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Package plugin
+        run: python3 scripts/package_addon.py
+
+      - name: Publish both installation formats
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/mmd_transplant-${version}.zip" \
+            "dist/mmd_transplant-${version}-legacy.zip" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "MMD Transplant $GITHUB_REF_NAME" \
+            --notes-file .github/release-notes.md \
+            --latest

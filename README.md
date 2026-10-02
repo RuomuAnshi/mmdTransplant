@@ -7,7 +7,7 @@ v0.3.1 优先按实际眼部几何估算头部比例，避免眼骨骼枢轴布�
 ## 安装
 
 1. 安装并启用 [MMD Tools](https://extensions.blender.org/add-ons/mmd-tools/)。
-2. 运行 `python3 scripts/package_addon.py` 生成安装包。
+2. 从 [Releases](https://github.com/RuomuAnshi/mmdTransplant/releases) 下载安装包，或运行 `python3 scripts/package_addon.py` 自行打包。
 3. 在 Blender 的“从磁盘安装 / Install from Disk”中选择 `dist/mmd_transplant-0.3.1.zip`，启用 **MMD 自动换头**。
 4. 传统插件安装流程可使用 `dist/mmd_transplant-0.3.1-legacy.zip`。两种形式只需安装一种，更新时替换旧版本。
 5. 在 3D 视图按 **N**，打开 **MMD 换头** 页签，操作时使用物体模式。
@@ -68,6 +68,8 @@ python3 scripts/package_addon.py
 ```
 
 公开测试仅使用程序构造的合成数据，覆盖索引重映射、SDEF 缩放、错误输入、材质范围、颈圈匹配、不同点数桥接和重复操作。
+
+发布前更新插件版本与 `.github/release-notes.md`，再推送对应的 `v` 版本标签。GitHub Actions 会检查公开源码、运行合成测试，并将两种安装包发布到 Release；标签必须与插件清单中的版本一致。
 
 ## 发布范围
 

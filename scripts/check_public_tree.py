@@ -13,7 +13,8 @@ names=git('ls-files','-z').decode().split('\0')
 issues=[]
 for name in filter(None,names):
     path=PurePosixPath(name)
-    allowed=(name in {'.gitignore','LICENSE','README.md','AGENTS.md'}
+    allowed=(name in {'.gitignore','LICENSE','README.md','AGENTS.md',
+                     '.github/workflows/release.yml','.github/release-notes.md'}
              or len(path.parts)==2 and path.parts[0] in {'mmd_transplant','scripts','tests'}
              and path.suffix in {'.py','.toml'})
     if not allowed:
