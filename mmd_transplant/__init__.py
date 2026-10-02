@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MMD 自动换头 / MMD Transplant",
     "author": "RuomuAnshi",
-    "version": (0, 3, 1),
+    "version": (0, 3, 2),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > MMD 换头",
     "description": "PMX 自动换头：保留身体骨架、头部表情、头发物理，并支持材质覆盖",
@@ -76,6 +76,8 @@ class MMDT_Settings(bpy.types.PropertyGroup):
     offset: FloatVectorProperty(name="位置微调", description="PMX 单位：X 左右，Y 上下，Z 前后；1 PMX 单位导入后默认 0.08 Blender 单位", size=3, default=(0, 0, 0), step=1, precision=3)
     physics: BoolProperty(name="保留新头部刚体和关节", default=True)
     fit_neck: BoolProperty(name="自动颈部贴合", description="相同点数局部贴合，不同点数生成皮肤连接面；保留权重与顶点表情", default=True)
+    match_skin: BoolProperty(name="颈部肤色过渡", description="为新增连接带采样两端皮肤并生成独立渐变贴图；原脸部与身体贴图不修改", default=True)
+    skin_strength: FloatProperty(name="肤色过渡强度", description="0 保留身体贴图；1 将连接带上端匹配头侧皮肤，下端匹配身体", min=0, max=1, default=1)
     import_scale: FloatProperty(name="Blender 导入比例", default=0.08, min=0.001, max=10)
     materials_open: BoolProperty(name="材质切分覆盖", default=False)
     advanced_open: BoolProperty(name="骨骼与导入设置", default=False)
@@ -179,6 +181,11 @@ class MMDT_OT_build(bpy.types.Operator):
                 # Keep files for image reloads and reopening saved .blend files.
                 folder = Path(bpy.utils.user_resource("DATAFILES", path="mmd_transplant", create=True)) / uuid.uuid4().hex
                 folder.mkdir(parents=True)
+            from .skin_blender import prepare_bridge_skin, mark_skin_materials
+            report['skin_color'] = prepare_bridge_skin(pmx, result, report, folder,
+                                                       s.skin_strength if s.match_skin else 0)
+            if report['skin_color']['status'] == 'skipped':
+                report['warnings'].append('肤色过渡未应用：'+report['skin_color']['reason'])
             missing = bundle_textures(result, folder)
             report["warnings"].extend(f"缺失贴图：{path}" for path in missing)
             filepath = folder / "model.pmx"
@@ -200,6 +207,7 @@ class MMDT_OT_build(bpy.types.Operator):
                     for collection in list(obj.users_collection):
                         collection.objects.unlink(obj)
                     new_collection.objects.link(obj)
+                mark_skin_materials(created, scene=context.scene)
                 _remove_preview(s.preview_collection)
                 s.preview_collection = new_collection
                 for obj in context.selected_objects:
@@ -223,6 +231,8 @@ class MMDT_OT_build(bpy.types.Operator):
                 s.status += "；颈部已桥接"
             elif report['neck_fit']['status']=='skipped':
                 s.status += "；颈部未自动贴合"
+            if report['skin_color']['status']=='matched':
+                s.status += "；颈部肤色已过渡"
             self.report({"INFO"}, str(filepath))
             for warning in report["warnings"][:5]:
                 self.report({"WARNING"}, warning)
@@ -286,6 +296,53 @@ class MMDT_OT_fit_neck(bpy.types.Operator):
             return {'CANCELLED'}
 
 
+class MMDT_OT_skin(bpy.types.Operator):
+    bl_idname = 'mmd_transplant.match_neck_skin'
+    bl_label = '修复当前颈部材质'
+    bl_description = '修正颈部连接带皮肤类型；可采样两端生成肤色过渡。保留几何、骨骼和表情，支持撤销'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and (context.scene.mmd_transplant.preview_collection is not None
+                                            or context.object is not None and context.object.type == 'MESH')
+
+    def execute(self, context):
+        from .skin_blender import is_bridge, match_existing_bridge, mark_skin_materials
+        s = context.scene.mmd_transplant
+        active = context.object
+        has_bridge = lambda o: o.type == 'MESH' and any(is_bridge(o.material_slots[p.material_index].material) for p in o.data.polygons)
+        meshes = ([active] if active is not None and has_bridge(active)
+                  else list(s.preview_collection.objects) if s.preview_collection else [])
+        meshes = [o for o in meshes if o.type == 'MESH'
+                  and any(is_bridge(slot.material) for slot in o.material_slots)]
+        if not meshes:
+            self.report({'ERROR'}, '没有找到颈部连接带，请选择换头网格或重新生成预览。')
+            return {'CANCELLED'}
+        try:
+            mesh = max(meshes, key=lambda o: len(o.data.vertices))
+            mark_skin_materials([mesh], scene=context.scene)
+            report = {'status': 'off'}
+            if s.match_skin and s.skin_strength > 0:
+                folder = Path(bpy.utils.user_resource('DATAFILES', path='mmd_transplant', create=True)) / uuid.uuid4().hex
+                try:
+                    report = match_existing_bridge(mesh, folder, s.skin_strength)
+                except (ValueError, RuntimeError, OSError) as exc:
+                    report = {'status': 'skipped', 'reason': str(exc)}
+                    self.report({'WARNING'}, '肤色过渡未应用：'+str(exc))
+            s.status = '颈部连接材质已标记为 SKIN'+('；肤色过渡已应用' if report['status'] == 'matched' else '')
+            if report['status'] == 'skipped':
+                s.status += '；肤色未自动匹配'
+            warnings = {slot.material.get('mmd_transplant_shader_warning') for slot in mesh.material_slots if slot.material}
+            for warning in warnings - {None}:
+                self.report({'WARNING'}, warning)
+            self.report({'INFO'}, s.status)
+            return {'FINISHED'}
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+
 class MMDT_PT_panel(bpy.types.Panel):
     bl_label = "MMD 自动换头"
     bl_idname = "MMDT_PT_panel"
@@ -311,6 +368,10 @@ class MMDT_PT_panel(bpy.types.Panel):
         box.prop(s, "physics")
         box.prop(s, "fit_neck")
         box.operator("mmd_transplant.fit_existing_neck", icon="MOD_SMOOTH")
+        box.prop(s, 'match_skin')
+        if s.match_skin:
+            box.prop(s, 'skin_strength')
+        box.operator('mmd_transplant.match_neck_skin', icon='MATERIAL')
         box = layout.box()
         box.prop(s, "materials_open", icon="TRIA_DOWN" if s.materials_open else "TRIA_RIGHT", emboss=False)
         if s.materials_open:
@@ -335,10 +396,10 @@ class MMDT_PT_panel(bpy.types.Panel):
         box.label(text=s.status, icon="INFO")
         if s.last_output:
             box.prop(s, "last_output", text="结果文件")
-        layout.label(text="接缝需检查；自动贴合不合并 UV 或匹配肤色")
+        layout.label(text="肤色过渡仅处理新增颈部连接带，仍需检查接缝")
 
 
-CLASSES = (MMDT_Material, MMDT_Settings, MMDT_UL_materials, MMDT_OT_pick, MMDT_OT_analyze, MMDT_OT_build, MMDT_OT_clear, MMDT_OT_fit_neck, MMDT_PT_panel)
+CLASSES = (MMDT_Material, MMDT_Settings, MMDT_UL_materials, MMDT_OT_pick, MMDT_OT_analyze, MMDT_OT_build, MMDT_OT_clear, MMDT_OT_fit_neck, MMDT_OT_skin, MMDT_PT_panel)
 
 
 def register():

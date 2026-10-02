@@ -3,6 +3,7 @@ import bpy
 from mathutils import Vector
 from collections import Counter,defaultdict
 from .neck import fit_plan
+from .skin_blender import material_name, is_bridge
 
 
 def fit_existing(mesh):
@@ -12,10 +13,10 @@ def fit_existing(mesh):
     points = [tuple(v.co) for v in mesh.data.vertices]
     head_faces, body_faces = {}, {}
     for polygon in mesh.data.polygons:
-        material = mesh.data.materials[polygon.material_index]
+        material = mesh.material_slots[polygon.material_index].material
         if material is None:
             continue
-        name = material.name
+        name = material_name(material)
         faces = head_faces if name.startswith('头_') else body_faces if name.startswith('身_') else None
         if faces is not None:
             faces.setdefault(polygon.material_index, []).append(tuple(polygon.vertices))
@@ -27,7 +28,7 @@ def fit_existing(mesh):
     anchor = transform @ bones['頭'].head_local
     width = ((transform @ bones['左目'].head_local)-(transform @ bones['右目'].head_local)).length
     band_ids={i for material,faces in head_faces.items()
-              if mesh.data.materials[material].name.startswith('头_颈部连接') for face in faces for i in face}
+              if is_bridge(mesh.material_slots[material].material) for face in faces for i in face}
     if band_ids:
         # The band uses independent UV vertices. Verify the original seam
         # counterparts rather than treating its top loop as an unfitted donor.
@@ -38,7 +39,7 @@ def fit_existing(mesh):
         geometric={i:tuple(round(x,6) for x in points[i]) for i in band_ids|outside}
         band_points={geometric[i] for i in band_ids}
         band_edges=Counter(tuple(sorted((geometric[a],geometric[b]))) for material,faces in head_faces.items()
-                           if mesh.data.materials[material].name.startswith('头_颈部连接')
+                           if is_bridge(mesh.material_slots[material].material)
                            for face in faces for a,b in zip(face,face[1:]+face[:1]))
         source_edges={tuple(sorted((geometric[a],geometric[b])))
                       for faces in list(head_faces.values())+list(body_faces.values()) for face in faces

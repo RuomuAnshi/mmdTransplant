@@ -84,6 +84,11 @@ class NeckTests(unittest.TestCase):
         report=fit_neck_pmx(pmx,model,{0},{1},(0,0,0),1)
         self.assertEqual(report['status'],'bridged')
         self.assertEqual(report['bridge_faces'],36)
+        self.assertIn('skin',model.materials[-1].name)
+        self.assertEqual(model.materials[-1].name_e,'neck_skin_bridge')
+        self.assertIn('[MMDTransplant:SKIN]',model.materials[-1].comment)
+        self.assertEqual(report['skin_bridge']['uv_space'],'PMX_TOP_LEFT')
+        self.assertEqual(report['skin_bridge']['head_uvs'],[vertices[i].uv for i in plan['source_indices'][:20]])
         start=len(points)
         self.assertEqual(original,[(v.co,tuple(influences(v))) for v in vertices[:start]])
         offsets={o.index:o.offset for o in model.morphs[0].offsets}
@@ -96,6 +101,22 @@ class NeckTests(unittest.TestCase):
         once=(len(model.vertices),len(model.faces))
         fit_neck_pmx(pmx,model,{0,2},{1},(0,0,0),1)
         self.assertEqual(once,(len(model.vertices),len(model.faces)))
+
+    def test_derived_strip_texture_keeps_source_uv_and_position_morphs(self):
+        from mmd_transplant.core import set_bridge_texture
+        vertices=[types.SimpleNamespace(uv=(.2,.3)) for _ in range(8)]
+        original=vertices[0].uv
+        def offset(index):return types.SimpleNamespace(index=index,offset=(.1,.2,0,0))
+        model=types.SimpleNamespace(vertices=vertices,textures=[],materials=[types.SimpleNamespace(texture=-1)],
+              morphs=[Morph([offset(0),offset(6)],3),Morph([offset(6)],1)])
+        meta={'skin_bridge':{'material':0,'head_vertices':[6],'body_vertices':[7]}}
+        set_bridge_texture(types.SimpleNamespace(Texture=lambda:types.SimpleNamespace()),model,meta,'derived.png')
+        self.assertEqual(model.vertices[0].uv,original)
+        self.assertEqual(model.vertices[6].uv,(.5,.5/128))
+        self.assertEqual(model.vertices[7].uv,(.5,1-.5/128))
+        self.assertEqual([o.index for o in model.morphs[0].offsets],[0])
+        self.assertEqual([o.index for o in model.morphs[1].offsets],[6])
+        self.assertEqual(model.materials[0].texture,0)
 
     def test_detect_match_and_leave_detached_hair_alone(self):
         points,faces,parts=fixture()

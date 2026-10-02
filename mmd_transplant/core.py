@@ -314,7 +314,7 @@ def transplant(pmx, head, body, options=None):
     out = pmx.Model()
     out.name = f"{head.name} × {body.name}"
     out.name_e = f"{head.name_e} on {body.name_e}"
-    out.comment = f"MMD Transplant 0.3.1\n头部来源：{head.filepath}\n身体来源：{body.filepath}\n\n{head.comment}\n\n{body.comment}"
+    out.comment = f"MMD Transplant 0.3.2\n头部来源：{head.filepath}\n身体来源：{body.filepath}\n\n{head.comment}\n\n{body.comment}"
     out.comment_e = head.comment_e + "\n" + body.comment_e
     keep_body = set(range(len(body.bones))) - (bb - {bi})
     bm = {old: new for new, old in enumerate(sorted(keep_body))}
@@ -542,7 +542,8 @@ def transplant(pmx, head, body, options=None):
             plan["warnings"].append("颈部未自动贴合：" + neck_report["reason"])
     validate(out)
     report = {k: v for k, v in plan.items() if k not in ("head_faces", "body_head_faces", "head_bones", "body_head_bones")}
-    report.update(neck_fit=neck_report, vertices=len(out.vertices), faces=len(out.faces), bones=len(out.bones), morphs=len(out.morphs),
+    report.update(neck_fit=neck_report, material_roles=({neck_report['skin_bridge']['material']: 'SKIN'}
+                  if 'skin_bridge' in neck_report else {}), vertices=len(out.vertices), faces=len(out.faces), bones=len(out.bones), morphs=len(out.morphs),
                   rigids=len(out.rigids), joints=len(out.joints), donor_faces=sum(plan["head_faces"]),
                   removed_body_faces=sum(plan["body_head_faces"]), body_bone_map=bm, head_bone_map=hm,
                   donor_vertex_map=maps[1][0], body_vertex_map=maps[0][0])
@@ -683,7 +684,11 @@ def bridge_neck_pmx(pmx, model, plan):
     sources=plan['source_indices'];n=len(head['points'])
     start=len(model.vertices);material_index=len(model.materials)
     material=deepcopy(model.materials[body['material']])
-    material.name='头_颈部连接'
+    # Keep the structural prefix, and expose the skin role to shader tools
+    # whose automatic classification only examines material names.
+    material.name='头_颈部连接_skin'
+    material.name_e='neck_skin_bridge'
+    material.comment=getattr(material,'comment','')+'\n[MMDTransplant:SKIN]'
     material.vertex_count=len(plan['triangles'])*3
     # This strip is skin geometry, not a new physics chain. Copy weights/SDEF
     # and position morphs from each exact boundary source to keep both joins shut.
@@ -724,7 +729,30 @@ def bridge_neck_pmx(pmx, model, plan):
     return {'status':'bridged','head_rim_vertices':n,'body_rim_vertices':len(body['points']),
             'bridge_vertices':len(sources),'bridge_faces':len(plan['triangles']),
             'head_material':model.materials[head['material']].name,
-            'body_material':model.materials[body['material']].name,'bridge_material':material.name}
+            'body_material':model.materials[body['material']].name,'bridge_material':material.name,
+            'skin_bridge': {'material':material_index,'head_material':head['material'],
+                            'body_material':body['material'],'head_vertices':list(range(start,start+n)),
+                            'body_vertices':list(range(start+n,start+len(sources))),
+                            'head_uvs':[tuple(model.vertices[i].uv) for i in sources[:n]],
+                            'body_uvs':[tuple(model.vertices[i].uv) for i in sources[n:]],
+                            'uv_space':'PMX_TOP_LEFT'}}
+
+
+def set_bridge_texture(pmx, model, neck_report, path, height=128):
+    """Assign a derived skin texture without touching source UVs/deformations."""
+    meta=neck_report['skin_bridge']
+    texture=pmx.Texture();texture.path=str(path)
+    model.textures.append(texture)
+    model.materials[meta['material']].texture=len(model.textures)-1
+    ids=set(meta['head_vertices']+meta['body_vertices'])
+    # PMX flips V on import. Sample the first/last texel centers to avoid
+    # blending the opposite endpoint when the renderer uses repeat wrapping.
+    for index in meta['head_vertices']:model.vertices[index].uv=(.5,.5/height)
+    for index in meta['body_vertices']:model.vertices[index].uv=(.5,1-.5/height)
+    # Original UV offsets belong to the source atlas, not this derived strip.
+    for morph in model.morphs:
+        if 3<=morph.type_index()<=7:
+            morph.offsets=[o for o in morph.offsets if o.index not in ids]
 
 
 def validate(model):
