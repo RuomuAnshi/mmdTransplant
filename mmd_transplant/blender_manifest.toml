@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+id = "mmd_transplant"
+version = "0.3.0"
+name = "MMD 自动换头"
+tagline = "Transplant PMX heads while preserving morphs and physics"
+maintainer = "RuomuAnshi"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
+tags = ["Rigging", "Import-Export"]
+
+[permissions]
+files = "Read PMX models and write combined models and textures"
