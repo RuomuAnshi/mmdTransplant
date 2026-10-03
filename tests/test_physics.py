@@ -93,6 +93,57 @@ class PhysicsTests(unittest.TestCase):
         self.assertEqual(result['bodies_linked'],0)
         self.assertFalse(rigid.rigid_body.kinematic)
 
+    def test_rootless_mmd_physics_is_quarantined_without_deletion(self):
+        class SimulationCollection(Collection):
+            @property
+            def all_objects(self):
+                return list(Collection.all_objects.fget(self).values())
+        bodies,joints,nested=(SimulationCollection(n) for n in ('bodies','joints','nested'))
+        storage=Collection('storage')
+        bodies.children.append(nested)
+        root=NS(mmd_type='ROOT',parent=None)
+        detached=obj('detached',body=True)
+        detached.mmd_type='RIGID_BODY';detached.parent=None
+        detached.constraints={'mmd_tools_rigid_parent':NS(target=None)}
+        intact=obj('intact',body=True)
+        intact.mmd_type='RIGID_BODY';intact.parent=root
+        intact.constraints={'mmd_tools_rigid_parent':NS(target=None)}
+        custom=obj('custom',body=True)
+        custom.parent=None;custom.mmd_type='NONE'
+        editable=obj('editable',body=True)
+        editable.mmd_type='RIGID_BODY';editable.parent=None
+        editable.constraints={'mmd_tools_rigid_parent':NS(target=NS())}
+        abandoned=obj('abandoned',joint=True)
+        abandoned.mmd_type='JOINT';abandoned.parent=None
+        abandoned.rigid_body_constraint.object1=detached
+        abandoned.rigid_body_constraint.object2=detached
+        valid=obj('valid',joint=True);valid.mmd_type='JOINT';valid.parent=root
+        valid.rigid_body_constraint.object1=intact;valid.rigid_body_constraint.object2=intact
+        temp=obj('temp',joint=True);temp.mmd_type='TEMPORARY';temp.parent=None
+        temp.rigid_body_constraint.object1=None;temp.rigid_body_constraint.object2=None
+        for o in (detached,intact,custom,editable):nested.objects.link(o)
+        for o in (abandoned,valid,temp):joints.objects.link(o)
+        storage.objects.link(detached)
+        children=[]
+        class Children(list):
+            def link(self,c):self.append(c)
+        children=Children()
+        scene=NS(rigidbody_world=NS(collection=bodies,constraints=joints),collection=NS(children=children))
+        helper=load_helper(NS(data=NS(collections=NS(new=Collection))))
+        self.assertEqual(helper.quarantine_orphans(scene),{'bodies':1,'joints':2})
+        quarantine=children[0]
+        self.assertTrue(quarantine.hide_viewport and quarantine.hide_render)
+        self.assertIn('detached',storage.all_objects)
+        self.assertIn('detached',quarantine.all_objects)
+        self.assertNotIn('detached',{o.name for o in bodies.all_objects})
+        self.assertEqual({o.name for o in bodies.all_objects},{'intact','custom','editable'})
+        self.assertEqual({o.name for o in joints.all_objects},{'valid'})
+        self.assertEqual(helper.quarantine_orphans(scene),{'bodies':0,'joints':0})
+        self.assertEqual(len(children),1)
+        result=helper.repair_membership([detached,abandoned,temp],scene)
+        self.assertEqual((result['bodies'],result['joints']),(0,0))
+        self.assertNotIn('detached',{o.name for o in bodies.all_objects})
+
     def test_empty_objects_do_not_create_a_world(self):
         scene=NS(rigidbody_world=None)
         result=load_helper(NS()).repair_membership([obj('mesh')],scene)

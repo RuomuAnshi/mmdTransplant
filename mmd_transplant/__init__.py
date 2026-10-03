@@ -214,7 +214,7 @@ class MMDT_OT_build(bpy.types.Operator):
                 created = set(bpy.data.objects) - before
                 new_collection = bpy.data.collections.new("MMD 换头预览")
                 context.scene.collection.children.link(new_collection)
-                from .physics_blender import move_to_preview
+                from .physics_blender import move_to_preview, quarantine_orphans
                 move_to_preview(created, new_collection, context.scene)
                 mark_skin_materials(created, scene=context.scene)
                 for obj in context.selected_objects:
@@ -247,6 +247,9 @@ class MMDT_OT_build(bpy.types.Operator):
                                 bpy.ops.view3d.view_selected(use_all_regions=False)
                 _remove_preview(s.preview_collection)
                 s.preview_collection = new_collection
+                abandoned = quarantine_orphans(context.scene)
+                if abandoned['bodies'] or abandoned['joints']:
+                    report["warnings"].append("已隔离失去模型根节点的残留物理；旧物理缓存需要清除并重新烘焙")
             s.last_output = str(filepath)
             s.status = ("已导出：" if self.export else "已生成预览：") + f"{report['faces']:,} 面 / {report['morphs']} 表情"
             if report['neck_fit']['status']=='fitted':
@@ -297,34 +300,6 @@ class MMDT_OT_clear(bpy.types.Operator):
         s.preview_collection = None
         s.status = "预览已移除；生成的 PMX 和贴图保留。"
         return {"FINISHED"}
-
-
-class MMDT_OT_physics_repair(bpy.types.Operator):
-    bl_idname = 'mmd_transplant.repair_physics'
-    bl_label = '修复已有模型物理连接'
-    bl_description = '将预览中的刚体和关节重新加入物理世界；保留模型、动作及刚体参数'
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        return context.scene.mmd_transplant.preview_collection is not None
-
-    def execute(self, context):
-        from .physics_blender import repair_membership
-        s = context.scene.mmd_transplant
-        try:
-            result = repair_membership(s.preview_collection.objects, context.scene)
-            if not result['bodies']:
-                self.report({'WARNING'}, '当前预览没有刚体；请开启头部物理并重新生成。')
-                return {'CANCELLED'}
-            s.status = f"物理连接已检查：{result['bodies']} 个刚体 / {result['joints']} 个关节；请从起始帧构建并播放物理"
-            if context.scene.rigidbody_world.point_cache.is_baked:
-                self.report({'WARNING'}, '当前物理缓存已烘焙，请清除旧缓存并重新烘焙。')
-            self.report({'INFO'}, f"已恢复 {result['bodies_linked']} 个刚体和 {result['joints_linked']} 个关节连接")
-            return {'FINISHED'}
-        except RuntimeError as exc:
-            self.report({'ERROR'}, str(exc))
-            return {'CANCELLED'}
 
 
 class MMDT_OT_fit_neck(bpy.types.Operator):
@@ -443,8 +418,6 @@ class MMDT_PT_panel(bpy.types.Panel):
         layout.label(text='手动模式：按已设置的参数生成' if s.manual_mode else '自动分析 · 比例匹配 · 颈部连接 · 肤色过渡')
         if MMDT_OT_fit_neck.poll(context):
             layout.operator('mmd_transplant.fit_existing_neck', icon='MOD_SMOOTH')
-        if s.preview_collection:
-            layout.operator('mmd_transplant.repair_physics', icon='PHYSICS')
         box = layout.box()
         for index, line in enumerate(s.status.split('；')):
             box.label(text=line, icon='INFO' if index == 0 else 'NONE')
@@ -482,7 +455,7 @@ class MMDT_PT_panel(bpy.types.Panel):
         layout.label(text='重新生成会替换预览，请先保存手动修改')
 
 
-CLASSES = (MMDT_Material, MMDT_Settings, MMDT_UL_materials, MMDT_OT_pick, MMDT_OT_analyze, MMDT_OT_build, MMDT_OT_clear, MMDT_OT_physics_repair, MMDT_OT_fit_neck, MMDT_OT_skin, MMDT_PT_panel)
+CLASSES = (MMDT_Material, MMDT_Settings, MMDT_UL_materials, MMDT_OT_pick, MMDT_OT_analyze, MMDT_OT_build, MMDT_OT_clear, MMDT_OT_fit_neck, MMDT_OT_skin, MMDT_PT_panel)
 
 
 def register():
