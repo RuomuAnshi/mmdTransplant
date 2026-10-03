@@ -16,6 +16,16 @@ def repeated(rgb, count=16):
 
 
 class SkinColorTests(unittest.TestCase):
+    def test_bridge_basis_can_represent_a_brighter_head_without_clipping(self):
+        head, body = (.8,.6,.5,1), (.7,.5,.4,1)
+        basis = color.bridge_diffuse_basis(head, body)
+        for source in (head, body):
+            encoded = tuple(source[i]/basis[i] for i in range(3))
+            self.assertTrue(all(0 <= c <= 1 for c in encoded))
+            self.assertRGBAlmostEqual(tuple(encoded[i]*basis[i] for i in range(3)), source[:3])
+        with self.assertRaises(ValueError):
+            color.bridge_diffuse_basis(head, (0,.5,.4,1))
+
     def assertRGBAlmostEqual(self, actual, expected, places=8):
         for first, second in zip(actual, expected):
             self.assertAlmostEqual(first, second, places=places)

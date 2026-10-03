@@ -2,11 +2,11 @@
 import bpy
 from mathutils import Vector
 from collections import Counter,defaultdict
-from .neck import fit_plan
+from .neck import fit_plan, bridge_plan, find_rim, distance
 from .skin_blender import material_name, is_bridge
 
 
-def fit_existing(mesh):
+def _neck_context(mesh):
     arm = mesh.find_armature()
     if arm is None:
         raise ValueError("网格没有绑定骨架。")
@@ -22,11 +22,23 @@ def fit_existing(mesh):
             faces.setdefault(polygon.material_index, []).append(tuple(polygon.vertices))
     bones = {p.mmd_bone.name_j:p.bone for p in arm.pose.bones if hasattr(p,'mmd_bone') and p.mmd_bone.name_j}
     bones.update({b.name:b for b in arm.data.bones if b.name not in bones})
-    if not all(name in bones for name in ('頭','左目','右目')):
-        raise ValueError("找不到 頭 / 左目 / 右目 骨骼，无法可靠估计颈部范围。")
+    def control(aliases):
+        return next((bones[name] for name in aliases if name in bones), None)
+    head = control(('頭','head','头','頭部'))
+    left = control(('左目','eye_l','left eye'))
+    right = control(('右目','eye_r','right eye'))
+    if not all((head,left,right)):
+        raise ValueError("找不到头部和左右眼控制骨骼，无法可靠估计颈部范围。")
     transform = mesh.matrix_world.inverted() @ arm.matrix_world
-    anchor = transform @ bones['頭'].head_local
-    width = ((transform @ bones['左目'].head_local)-(transform @ bones['右目'].head_local)).length
+    anchor = transform @ head.head_local
+    width = ((transform @ left.head_local)-(transform @ right.head_local)).length
+    if width <= 1e-6:
+        raise ValueError('眼部定位距离无效，无法可靠估计颈部范围。')
+    return arm, points, head_faces, body_faces, anchor, width
+
+
+def fit_existing(mesh):
+    arm, points, head_faces, body_faces, anchor, width = _neck_context(mesh)
     band_ids={i for material,faces in head_faces.items()
               if is_bridge(mesh.material_slots[material].material) for face in faces for i in face}
     if band_ids:
@@ -107,3 +119,116 @@ def fit_existing(mesh):
         mesh.data.update()
     bpy.context.view_layer.update()
     return result
+
+
+def repair_existing(mesh):
+    """Bridge a credible neck gap in a copy, retaining edited source data.
+
+    New boundary vertices copy their source weights and every shape key.
+    Broken generated strips can be replaced; unrelated holes are untouched.
+    """
+    import bmesh
+    arm, points, head_faces, body_faces, anchor, width = _neck_context(mesh)
+    bands = {i for i in head_faces if is_bridge(mesh.material_slots[i].material)}
+    if bands:
+        try:
+            intact = fit_existing(mesh)
+            if intact['status'] == 'already_bridged':
+                return intact
+        except ValueError:
+            pass
+    original_head = {i:faces for i,faces in head_faces.items() if i not in bands}
+    head = find_rim(points, original_head, tuple(anchor), width, up=2)
+    body = find_rim(points, body_faces, tuple(anchor), width, up=2)
+    if head is None or body is None:
+        missing = '头侧' if head is None else '身体侧'
+        raise ValueError(f'未找到完整可信的{missing}颈部边界；边界可能破损、材质来源标记丢失或超出搜索范围，需要手动整理边界。')
+    plan = bridge_plan(points, original_head, body_faces, tuple(anchor), width, up=2,
+                       head_rim=head, body_rim=body, allow_equal=True)
+    if plan is None:
+        if not bands and len(head['points']) == len(body['points']):
+            return fit_existing(mesh)
+        raise ValueError('颈部边界交叉、重叠或距离过大，不能安全补面；请先调整头部位置或重新一键生成。')
+    if mesh.data.shape_keys and any(k.name.startswith('mmd_sdef') for k in mesh.data.shape_keys.key_blocks):
+        raise ValueError('网格含已绑定的 SDEF 缓存，不能安全改变顶点数量；请先解除 SDEF 绑定或重新生成。')
+    bone_groups = {g.index for g in mesh.vertex_groups if g.name in arm.data.bones}
+    sources = plan['source_indices']
+    if any(not any(g.group in bone_groups and g.weight>1e-8 for g in mesh.data.vertices[i].groups) for i in sources):
+        raise ValueError('颈部边界缺少有效骨骼权重，请先修复权重。')
+    candidate = mesh.copy()
+    candidate.data = mesh.data.copy()
+    material = mesh.material_slots[body['material']].material.copy()
+    material.name = '头_颈部连接_skin'
+    material['mmd_transplant_surface'] = 'SKIN_BRIDGE'
+    if 'zd_original_name' in material:
+        material['zd_original_name'] = material.name
+    if hasattr(material, 'mmd_material'):
+        material.mmd_material.name_j = material.name
+        material.mmd_material.name_e = 'neck_skin_bridge'
+    bm = bmesh.new()
+    committed = False
+    try:
+        bm.from_mesh(candidate.data)
+        bm.verts.ensure_lookup_table();bm.faces.ensure_lookup_table()
+        originals = [bm.verts[i] for i in sources]
+        normals = {loop:tuple(mesh.data.loops[index].normal)
+                   for face, polygon in zip(bm.faces, mesh.data.polygons)
+                   for loop, index in zip(face.loops, polygon.loop_indices)} if mesh.data.has_custom_normals else None
+        if bands:
+            bmesh.ops.delete(bm, geom=[f for f in bm.faces if f.material_index in bands], context='FACES')
+        slot = len(candidate.data.materials)
+        candidate.data.materials.append(material)
+        deform = bm.verts.layers.deform.verify()
+        new = []
+        for source in originals:
+            vertex = bm.verts.new(source.co)
+            # Copy shape layers explicitly. copy_from also copies internal
+            # shape-key indices and can invalidate a newly created BMVert.
+            for kind in ('shape','float','int','string','float_vector','color','float_color'):
+                access = getattr(bm.verts.layers,kind,None)
+                if access is not None:
+                    for layer in access.values():
+                        vertex[layer] = source[layer]
+            for group, weight in source[deform].items():
+                if group in bone_groups:
+                    vertex[deform][group] = weight
+            new.append(vertex)
+        n = len(plan['head_rim']['points'])
+        # The strip initially uses the body's atlas, while all original UVs
+        # remain unchanged. Optional skin matching can give it its own atlas.
+        uv_refs = {}
+        for layer in bm.loops.layers.uv.values():
+            refs = {}
+            for face in bm.faces:
+                if face.material_index == body['material']:
+                    for loop in face.loops:
+                        refs.setdefault(loop.vert, loop[layer].uv.copy())
+            uv_refs[layer] = refs
+        for triangle in plan['triangles']:
+            face = bm.faces.new([new[i] for i in triangle])
+            face.material_index = slot
+            face.smooth = True
+            for loop, index in zip(face.loops, triangle):
+                reference = index if index >= n else n+min(range(len(new)-n), key=lambda j:distance(points[sources[index]],points[sources[n+j]]))
+                for layer, refs in uv_refs.items():
+                    if originals[reference] in refs:
+                        loop[layer].uv = refs[originals[reference]]
+        custom = [normals.get(loop,(0,0,0)) for face in bm.faces for loop in face.loops] if normals is not None else None
+        bm.to_mesh(candidate.data)
+        candidate.data.update()
+        if custom is not None:
+            candidate.data.normals_split_custom_set(custom)
+        # Commit only after geometry creation has succeeded.
+        mesh.data = candidate.data
+        committed = True
+        bpy.context.view_layer.update()
+        return {'status':'rebridged' if bands else 'bridged','bridge_faces':len(plan['triangles']),
+                'bridge_vertices':len(sources),'rim_vertices':len(sources),'material':slot}
+    finally:
+        bm.free()
+        data = candidate.data
+        bpy.data.objects.remove(candidate,do_unlink=True)
+        if not committed and data.users == 0:
+            bpy.data.meshes.remove(data)
+        if not committed and material.users == 0:
+            bpy.data.materials.remove(material)

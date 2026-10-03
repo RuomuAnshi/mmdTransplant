@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "mmd_transplant"
-version = "0.3.2"
+version = "0.3.3"
 name = "MMD 自动换头"
 tagline = "Transplant PMX heads while preserving morphs and physics"
 maintainer = "RuomuAnshi"

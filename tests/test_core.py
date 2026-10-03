@@ -56,6 +56,21 @@ class Morph:
 
 
 class CoreTests(unittest.TestCase):
+    def test_bridge_rebase_preserves_body_additive_tint_and_source_material(self):
+        body = NS(diffuse=(.5,.4,.3,1), ambient=(.1,.1,.1))
+        bridge = deepcopy(body)
+        original = NS(index=0,offset_type=1,diffuse_offset=(.1,.1,.1,0),ambient_offset=(.02,.02,.02))
+        derived = deepcopy(original);derived.index=1
+        model = NS(materials=[body,bridge],morphs=[Morph('synthetic_tint',8,[original,derived])])
+        color = (.8,.6,.5,1)
+        core.rebase_bridge_diffuse(model,1,color)
+        for i in range(3):
+            texture = body.diffuse[i]/color[i]
+            self.assertAlmostEqual(texture*(bridge.diffuse[i]+derived.diffuse_offset[i]),body.diffuse[i]+original.diffuse_offset[i])
+            self.assertAlmostEqual(texture*(bridge.ambient[i]+derived.ambient_offset[i]),body.ambient[i]+original.ambient_offset[i])
+        self.assertEqual(body.diffuse,(.5,.4,.3,1))
+        self.assertEqual(original.diffuse_offset,(.1,.1,.1,0))
+
     def test_auto_scale_uses_eye_geometry_instead_of_misplaced_pivots(self):
         head, body = eye_fixture(), eye_fixture()
         body.bones[3].location = (0.12, 2.2, 0)

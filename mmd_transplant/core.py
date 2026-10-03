@@ -314,7 +314,7 @@ def transplant(pmx, head, body, options=None):
     out = pmx.Model()
     out.name = f"{head.name} × {body.name}"
     out.name_e = f"{head.name_e} on {body.name_e}"
-    out.comment = f"MMD Transplant 0.3.2\n头部来源：{head.filepath}\n身体来源：{body.filepath}\n\n{head.comment}\n\n{body.comment}"
+    out.comment = f"MMD Transplant 0.3.3\n头部来源：{head.filepath}\n身体来源：{body.filepath}\n\n{head.comment}\n\n{body.comment}"
     out.comment_e = head.comment_e + "\n" + body.comment_e
     keep_body = set(range(len(body.bones))) - (bb - {bi})
     bm = {old: new for new, old in enumerate(sorted(keep_body))}
@@ -736,6 +736,23 @@ def bridge_neck_pmx(pmx, model, plan):
                             'head_uvs':[tuple(model.vertices[i].uv) for i in sources[:n]],
                             'body_uvs':[tuple(model.vertices[i].uv) for i in sources[n:]],
                             'uv_space':'PMX_TOP_LEFT'}}
+
+
+def rebase_bridge_diffuse(model, index, color):
+    """Change only the derived strip's basis; preserve additive body tints."""
+    material = model.materials[index]
+    ratio = tuple(color[i]/material.diffuse[i] for i in range(3))
+    if hasattr(material, 'ambient'):
+        material.ambient = tuple(c*r for c, r in zip(material.ambient, ratio))
+    for morph in model.morphs:
+        if morph.type_index() != 8:
+            continue
+        for offset in morph.offsets:
+            if offset.index == index and getattr(offset, 'offset_type', 0) == 1:
+                offset.diffuse_offset = tuple(offset.diffuse_offset[i]*ratio[i] for i in range(3)) + (offset.diffuse_offset[3],)
+                if hasattr(offset, 'ambient_offset'):
+                    offset.ambient_offset = tuple(c*r for c, r in zip(offset.ambient_offset, ratio))
+    material.diffuse = color
 
 
 def set_bridge_texture(pmx, model, neck_report, path, height=128):

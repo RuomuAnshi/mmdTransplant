@@ -11,6 +11,15 @@ import math
 from statistics import median
 
 
+def bridge_diffuse_basis(head, body):
+    """Give a derived strip enough color range for both source materials."""
+    if len(head) != 4 or len(body) != 4 or not all(math.isfinite(c) and 0 <= c <= 1 for c in tuple(head)+tuple(body)):
+        raise ValueError('皮肤材质颜色超出支持范围')
+    if min(body[:3]) < .05:
+        raise ValueError('身体材质颜色过暗，无法安全匹配')
+    return tuple(max(a, b) for a, b in zip(head[:3], body[:3])) + (body[3],)
+
+
 def srgb_to_linear(rgb):
     """Convert three normalized sRGB channels to scene-linear RGB."""
     return tuple(value / 12.92 if value <= 0.04045

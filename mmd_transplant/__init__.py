@@ -1,7 +1,7 @@
 bl_info = {
     "name": "MMD 自动换头 / MMD Transplant",
     "author": "RuomuAnshi",
-    "version": (0, 3, 2),
+    "version": (0, 3, 3),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > MMD 换头",
     "description": "PMX 自动换头：保留身体骨架、头部表情、头发物理，并支持材质覆盖",
@@ -19,6 +19,7 @@ import bpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, FloatVectorProperty, PointerProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 from .core import Options, TransplantError, analyze, bundle_textures, transplant, validate
+from .automatic import assess_result, transplant_automatic
 
 
 def pmx_module():
@@ -42,6 +43,8 @@ def load_models(settings):
 
 
 def options_from(s):
+    if not s.manual_mode:
+        return Options()
     return Options(head_bone=s.head_bone, body_head_bone=s.body_head_bone, threshold=s.threshold,
                    auto_scale=s.auto_scale, scale=s.scale, offset=tuple(s.offset),
                    head_materials={item.index: item.mode for item in s.head_materials},
@@ -53,7 +56,7 @@ def options_from(s):
 def invalidate(s, context):
     s.head_materials.clear()
     s.body_materials.clear()
-    s.status = "模型已更改，请重新分析。"
+    s.status = "来源已更改，点击 2 一键生成。"
 
 
 class MMDT_Material(bpy.types.PropertyGroup):
@@ -79,13 +82,16 @@ class MMDT_Settings(bpy.types.PropertyGroup):
     match_skin: BoolProperty(name="颈部肤色过渡", description="为新增连接带采样两端皮肤并生成独立渐变贴图；原脸部与身体贴图不修改", default=True)
     skin_strength: FloatProperty(name="肤色过渡强度", description="0 保留身体贴图；1 将连接带上端匹配头侧皮肤，下端匹配身体", min=0, max=1, default=1)
     import_scale: FloatProperty(name="Blender 导入比例", default=0.08, min=0.001, max=10)
+    manual_mode: BoolProperty(name="使用手动参数", description="关闭时自动分析、匹配比例和颈部，忽略旧的微调与材质覆盖", default=False)
+    adjustments_open: BoolProperty(name="手动调整与分析", default=False)
+    export_open: BoolProperty(name="导出文件", default=False)
     materials_open: BoolProperty(name="材质切分覆盖", default=False)
     advanced_open: BoolProperty(name="骨骼与导入设置", default=False)
     head_materials: CollectionProperty(type=MMDT_Material)
     body_materials: CollectionProperty(type=MMDT_Material)
     head_material_index: bpy.props.IntProperty()
     body_material_index: bpy.props.IntProperty()
-    status: StringProperty(default="选择头部与身体 PMX，然后分析范围。")
+    status: StringProperty(default="选择头部与身体 PMX，点击 2 一键生成。")
     last_output: StringProperty(subtype="FILE_PATH")
     preview_collection: PointerProperty(type=bpy.types.Collection)
 
@@ -153,24 +159,26 @@ def _remove_preview(collection):
 
 class MMDT_OT_build(bpy.types.Operator):
     bl_idname = "mmd_transplant.build"
-    bl_label = "2. 生成换头预览"
-    bl_description = "在新集合生成换头模型；可修改参数后重新预览。原模型不修改"
+    bl_label = "2. 一键生成换头模型"
+    bl_description = "自动分析、匹配比例、贴合颈部并过渡肤色，在新集合生成可编辑模型"
     bl_options = {"REGISTER", "UNDO"}
     export: BoolProperty(default=False, options={"HIDDEN"})
 
     @classmethod
     def poll(cls, context):
-        return context.mode == "OBJECT"
+        return context.scene is not None
 
     def execute(self, context):
         s = context.scene.mmd_transplant
         old_selection = list(context.selected_objects)
         old_active = context.view_layer.objects.active
+        old_mode = old_active.mode if old_active else 'OBJECT'
         before = set(bpy.data.objects)
         new_collection = None
         try:
             pmx, head, body = load_models(s)
-            result, report = transplant(pmx, head, body, options_from(s))
+            result, report = (transplant(pmx, head, body, options_from(s)) if s.manual_mode
+                              else transplant_automatic(pmx, head, body))
             if self.export:
                 if not s.output_dir.strip():
                     raise TransplantError("请设置输出文件夹。")
@@ -183,11 +191,12 @@ class MMDT_OT_build(bpy.types.Operator):
                 folder.mkdir(parents=True)
             from .skin_blender import prepare_bridge_skin, mark_skin_materials
             report['skin_color'] = prepare_bridge_skin(pmx, result, report, folder,
-                                                       s.skin_strength if s.match_skin else 0)
+                                                       (s.skin_strength if s.match_skin else 0) if s.manual_mode else 1)
             if report['skin_color']['status'] == 'skipped':
                 report['warnings'].append('肤色过渡未应用：'+report['skin_color']['reason'])
             missing = bundle_textures(result, folder)
             report["warnings"].extend(f"缺失贴图：{path}" for path in missing)
+            report['quality'] = assess_result(report, report['skin_color'], missing)
             filepath = folder / "model.pmx"
             uv_count = max((len(v.additional_uvs) for v in result.vertices), default=0)
             pmx.save(str(filepath), result, add_uv_count=uv_count)
@@ -196,33 +205,48 @@ class MMDT_OT_build(bpy.types.Operator):
                 report.pop(key, None)
             (folder / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             if not self.export:
-                imported = bpy.ops.mmd_tools.import_model(filepath=str(filepath), scale=s.import_scale,
+                if context.object and context.object.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                imported = bpy.ops.mmd_tools.import_model(filepath=str(filepath), scale=s.import_scale if s.manual_mode else .08,
                     clean_model=False, remove_doubles=False, save_log=False, log_level="ERROR")
                 if "FINISHED" not in imported:
                     raise TransplantError("mmd_tools 导入失败；已生成文件保留在 " + str(filepath))
                 created = set(bpy.data.objects) - before
                 new_collection = bpy.data.collections.new("MMD 换头预览")
                 context.scene.collection.children.link(new_collection)
-                for obj in created:
-                    for collection in list(obj.users_collection):
-                        collection.objects.unlink(obj)
-                    new_collection.objects.link(obj)
+                from .physics_blender import move_to_preview
+                move_to_preview(created, new_collection, context.scene)
                 mark_skin_materials(created, scene=context.scene)
-                _remove_preview(s.preview_collection)
-                s.preview_collection = new_collection
                 for obj in context.selected_objects:
                     obj.select_set(False)
                 armatures = [o for o in created if o.type == "ARMATURE"]
                 if armatures:
                     armatures[0].hide_set(False)
                     armatures[0].show_in_front = True
-                    armatures[0].select_set(True)
-                    context.view_layer.objects.active = armatures[0]
+                meshes = [o for o in created if o.type == 'MESH' and any(m.type == 'ARMATURE' for m in o.modifiers)]
+                primary = max(meshes, key=lambda o: len(o.data.vertices), default=None)
+                if primary:
+                    primary.hide_set(False)
+                    primary.select_set(True)
+                    context.view_layer.objects.active = primary
                 if context.screen is not None:
                     for area in context.screen.areas:
                         if area.type == "VIEW_3D":
-                            area.spaces.active.overlay.show_overlays = True
-                            area.spaces.active.overlay.show_bones = True
+                            space = area.spaces.active
+                            space.overlay.show_overlays = True
+                            space.overlay.show_bones = True
+                            # Add the result to an existing local view without
+                            # isolating the rest of the user's scene ourselves.
+                            if space.local_view:
+                                for obj in created:
+                                    obj.local_view_set(space, True)
+                    if primary and context.area and context.area.type == 'VIEW_3D':
+                        region = next((r for r in context.area.regions if r.type == 'WINDOW'), None)
+                        if region:
+                            with context.temp_override(region=region):
+                                bpy.ops.view3d.view_selected(use_all_regions=False)
+                _remove_preview(s.preview_collection)
+                s.preview_collection = new_collection
             s.last_output = str(filepath)
             s.status = ("已导出：" if self.export else "已生成预览：") + f"{report['faces']:,} 面 / {report['morphs']} 表情"
             if report['neck_fit']['status']=='fitted':
@@ -233,6 +257,10 @@ class MMDT_OT_build(bpy.types.Operator):
                 s.status += "；颈部未自动贴合"
             if report['skin_color']['status']=='matched':
                 s.status += "；颈部肤色已过渡"
+            if report.get('automatic_alignment', {}).get('applied'):
+                s.status += '；头部位置已自动校正'
+            if report['quality']['issues']:
+                s.status += '；需检查：'+'、'.join(report['quality']['issues'])
             self.report({"INFO"}, str(filepath))
             for warning in report["warnings"][:5]:
                 self.report({"WARNING"}, warning)
@@ -248,6 +276,11 @@ class MMDT_OT_build(bpy.types.Operator):
                     obj.select_set(True)
             if old_active and old_active.name in bpy.data.objects:
                 context.view_layer.objects.active = old_active
+                if old_mode != 'OBJECT' and old_active.mode != old_mode:
+                    try:
+                        bpy.ops.object.mode_set(mode=old_mode)
+                    except RuntimeError:
+                        pass
             s.status = str(exc)
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -266,26 +299,71 @@ class MMDT_OT_clear(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class MMDT_OT_physics_repair(bpy.types.Operator):
+    bl_idname = 'mmd_transplant.repair_physics'
+    bl_label = '修复已有模型物理连接'
+    bl_description = '将预览中的刚体和关节重新加入物理世界；保留模型、动作及刚体参数'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.scene.mmd_transplant.preview_collection is not None
+
+    def execute(self, context):
+        from .physics_blender import repair_membership
+        s = context.scene.mmd_transplant
+        try:
+            result = repair_membership(s.preview_collection.objects, context.scene)
+            if not result['bodies']:
+                self.report({'WARNING'}, '当前预览没有刚体；请开启头部物理并重新生成。')
+                return {'CANCELLED'}
+            s.status = f"物理连接已检查：{result['bodies']} 个刚体 / {result['joints']} 个关节；请从起始帧构建并播放物理"
+            if context.scene.rigidbody_world.point_cache.is_baked:
+                self.report({'WARNING'}, '当前物理缓存已烘焙，请清除旧缓存并重新烘焙。')
+            self.report({'INFO'}, f"已恢复 {result['bodies_linked']} 个刚体和 {result['joints_linked']} 个关节连接")
+            return {'FINISHED'}
+        except RuntimeError as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+
 class MMDT_OT_fit_neck(bpy.types.Operator):
     bl_idname = "mmd_transplant.fit_existing_neck"
-    bl_label = "贴合当前模型颈部"
-    bl_description = "分析并贴合已经生成或编辑的换头网格；保留当前其他修改，支持撤销"
+    bl_label = "修复颈部连接"
+    bl_description = "识别颈部边界并补面、重新桥接或局部贴合；保留权重和表情，支持撤销"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls,context):
-        return context.mode=='OBJECT' and context.scene.mmd_transplant.preview_collection is not None
+        return context.mode=='OBJECT' and (context.scene.mmd_transplant.preview_collection is not None
+            or context.object is not None and context.object.type=='MESH' and context.object.find_armature() is not None)
 
     def execute(self,context):
-        from .neck_blender import fit_existing
+        from .neck_blender import repair_existing
         s=context.scene.mmd_transplant
-        meshes=[o for o in s.preview_collection.objects if o.type=='MESH' and o.find_armature() is not None]
+        active=context.object
+        meshes=([active] if active is not None and active.type=='MESH' and active.find_armature() is not None
+                else [o for o in s.preview_collection.objects if o.type=='MESH' and o.find_armature() is not None] if s.preview_collection else [])
         if not meshes:
             self.report({'ERROR'},'预览集合中没有绑定骨架的角色网格。')
             return {'CANCELLED'}
         try:
             mesh=max(meshes,key=lambda o:len(o.data.vertices))
-            report=fit_existing(mesh)
+            report=repair_existing(mesh)
+            if report['status'] in ('bridged','rebridged'):
+                from .skin_blender import mark_skin_materials, match_existing_bridge
+                mark_skin_materials([mesh],scene=context.scene)
+                s.status=f"颈部已{'重新桥接' if report['status']=='rebridged' else '补面连接'}：{report['bridge_faces']} 个连接面；权重与表情已保留"
+                if not s.manual_mode or s.match_skin:
+                    try:
+                        folder=Path(bpy.utils.user_resource('DATAFILES',path='mmd_transplant',create=True))/uuid.uuid4().hex
+                        skin=match_existing_bridge(mesh,folder,s.skin_strength if s.manual_mode else 1.0)
+                        if skin['status']=='matched':s.status+='；肤色过渡已应用'
+                        elif skin['status']=='skipped':s.status+='；肤色未匹配：'+skin.get('reason','请检查材质')
+                    except (ValueError,RuntimeError,OSError) as exc:
+                        s.status+='；肤色未匹配：'+str(exc)
+                self.report({'INFO'},s.status)
+                return {'FINISHED'}
             s.status=("颈部已有连接面，边界已闭合，无需重复桥接" if report['status']=='already_bridged'
                       else f"颈部已贴合，无需再次调整：{report['rim_vertices']} 对边界点" if report['status']=='already_fitted'
                       else f"颈部贴合：{report['rim_vertices']} 对边界点；{report['affected_vertices']} 个局部顶点")
@@ -317,7 +395,7 @@ class MMDT_OT_skin(bpy.types.Operator):
         meshes = [o for o in meshes if o.type == 'MESH'
                   and any(is_bridge(slot.material) for slot in o.material_slots)]
         if not meshes:
-            self.report({'ERROR'}, '没有找到颈部连接带，请选择换头网格或重新生成预览。')
+            self.report({'ERROR'}, '没有连接带可修复材质。若颈部有裂缝，请先点击“修复颈部连接”；已贴合的颈部可能不需要连接带。')
             return {'CANCELLED'}
         try:
             mesh = max(meshes, key=lambda o: len(o.data.vertices))
@@ -359,47 +437,52 @@ class MMDT_PT_panel(bpy.types.Panel):
             row = layout.row(align=True)
             row.prop(s, prop, text="")
             row.operator("mmd_transplant.pick", text="", icon="FILE_FOLDER").target = target
-        layout.operator("mmd_transplant.analyze", icon="VIEWZOOM")
-        box = layout.box()
-        box.prop(s, "auto_scale")
-        box.prop(s, "scale")
-        box.label(text="偏移：X 左右 / Y 上下 / Z 前后")
-        box.prop(s, "offset", text="")
-        box.prop(s, "physics")
-        box.prop(s, "fit_neck")
-        box.operator("mmd_transplant.fit_existing_neck", icon="MOD_SMOOTH")
-        box.prop(s, 'match_skin')
-        if s.match_skin:
-            box.prop(s, 'skin_strength')
-        box.operator('mmd_transplant.match_neck_skin', icon='MATERIAL')
-        box = layout.box()
-        box.prop(s, "materials_open", icon="TRIA_DOWN" if s.materials_open else "TRIA_RIGHT", emboss=False)
-        if s.materials_open:
-            box.label(text="百分比 = 识别为头部的面；可逐项覆盖")
-            box.label(text="头源：是头部 → 导入；非头部 → 忽略")
-            box.template_list("MMDT_UL_materials", "head", s, "head_materials", s, "head_material_index", rows=5)
-            box.label(text="身源：是头部 → 移除；非头部 → 保留")
-            box.template_list("MMDT_UL_materials", "body", s, "body_materials", s, "body_material_index", rows=5)
-        box = layout.box()
-        box.prop(s, "advanced_open", icon="TRIA_DOWN" if s.advanced_open else "TRIA_RIGHT", emboss=False)
-        if s.advanced_open:
-            for prop in ("head_bone", "body_head_bone", "extra_bones", "threshold", "import_scale"):
-                box.prop(s, prop)
         row = layout.row(align=True)
+        row.scale_y = 1.8
         row.operator("mmd_transplant.build", icon="MOD_ARMATURE")
-        row.operator("mmd_transplant.clear_preview", text="", icon="TRASH")
-        layout.label(text="修改参数后可重新生成预览")
-        layout.separator()
-        layout.prop(s, "output_dir")
-        layout.operator("mmd_transplant.build", text="3. 导出 PMX + 贴图", icon="EXPORT").export = True
+        layout.label(text='手动模式：按已设置的参数生成' if s.manual_mode else '自动分析 · 比例匹配 · 颈部连接 · 肤色过渡')
+        if MMDT_OT_fit_neck.poll(context):
+            layout.operator('mmd_transplant.fit_existing_neck', icon='MOD_SMOOTH')
+        if s.preview_collection:
+            layout.operator('mmd_transplant.repair_physics', icon='PHYSICS')
         box = layout.box()
-        box.label(text=s.status, icon="INFO")
-        if s.last_output:
-            box.prop(s, "last_output", text="结果文件")
-        layout.label(text="肤色过渡仅处理新增颈部连接带，仍需检查接缝")
+        for index, line in enumerate(s.status.split('；')):
+            box.label(text=line, icon='INFO' if index == 0 else 'NONE')
+        box = layout.box()
+        box.prop(s, 'adjustments_open', icon='TRIA_DOWN' if s.adjustments_open else 'TRIA_RIGHT', emboss=False)
+        if s.adjustments_open:
+            box.prop(s, 'manual_mode')
+            if not s.manual_mode:
+                box.label(text='自动模式忽略旧的微调与材质覆盖')
+            controls = box.column()
+            controls.enabled = s.manual_mode
+            controls.operator('mmd_transplant.analyze', icon='VIEWZOOM')
+            for prop in ('auto_scale', 'scale', 'offset', 'physics', 'fit_neck', 'match_skin', 'skin_strength'):
+                controls.prop(s, prop)
+            controls.prop(s, 'materials_open', icon='TRIA_DOWN' if s.materials_open else 'TRIA_RIGHT', emboss=False)
+            if s.materials_open:
+                controls.label(text='头源：包含头部；身源：移除旧头')
+                controls.template_list('MMDT_UL_materials', 'head', s, 'head_materials', s, 'head_material_index', rows=5)
+                controls.template_list('MMDT_UL_materials', 'body', s, 'body_materials', s, 'body_material_index', rows=5)
+            controls.prop(s, 'advanced_open', icon='TRIA_DOWN' if s.advanced_open else 'TRIA_RIGHT', emboss=False)
+            if s.advanced_open:
+                for prop in ('head_bone', 'body_head_bone', 'extra_bones', 'threshold', 'import_scale'):
+                    controls.prop(s, prop)
+            box.separator()
+            box.operator('mmd_transplant.fit_existing_neck', icon='MOD_SMOOTH')
+            box.operator('mmd_transplant.match_neck_skin', icon='MATERIAL')
+            box.operator('mmd_transplant.clear_preview', icon='TRASH')
+        box = layout.box()
+        box.prop(s, 'export_open', icon='TRIA_DOWN' if s.export_open else 'TRIA_RIGHT', emboss=False)
+        if s.export_open:
+            box.prop(s, 'output_dir')
+            box.operator('mmd_transplant.build', text='3. 导出 PMX + 贴图', icon='EXPORT').export = True
+            if s.last_output:
+                box.prop(s, 'last_output', text='结果文件')
+        layout.label(text='重新生成会替换预览，请先保存手动修改')
 
 
-CLASSES = (MMDT_Material, MMDT_Settings, MMDT_UL_materials, MMDT_OT_pick, MMDT_OT_analyze, MMDT_OT_build, MMDT_OT_clear, MMDT_OT_fit_neck, MMDT_OT_skin, MMDT_PT_panel)
+CLASSES = (MMDT_Material, MMDT_Settings, MMDT_UL_materials, MMDT_OT_pick, MMDT_OT_analyze, MMDT_OT_build, MMDT_OT_clear, MMDT_OT_physics_repair, MMDT_OT_fit_neck, MMDT_OT_skin, MMDT_PT_panel)
 
 
 def register():

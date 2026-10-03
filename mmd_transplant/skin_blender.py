@@ -8,8 +8,8 @@ import uuid
 import zlib
 
 import bpy
-from .skin_color import estimate_base_color, gradient_rgba, linear_to_srgb, sample_bilinear_rgba, srgb_to_linear
-from .core import set_bridge_texture
+from .skin_color import bridge_diffuse_basis, estimate_base_color, gradient_rgba, linear_to_srgb, sample_bilinear_rgba, srgb_to_linear
+from .core import rebase_bridge_diffuse, set_bridge_texture
 
 
 def material_name(material):
@@ -112,9 +112,11 @@ def prepare_bridge_skin(pmx, model, report, folder, strength=1.0):
             else:
                 sample = [(1, 1, 1, 1)] * len(uvs)
             samples.append(sample)
-        head, body, confidence = _endpoints(*samples, *diffuse)
+        basis = bridge_diffuse_basis(*diffuse)
+        head, body, confidence = _endpoints(*samples, *diffuse, basis)
         path = Path(folder) / 'textures' / ('neck_skin_'+uuid.uuid4().hex[:12]+'.png')
         _write_gradient(path, head, body, strength)
+        rebase_bridge_diffuse(model, meta['material'], basis)
         set_bridge_texture(pmx, model, report['neck_fit'], path.resolve())
         return {'status': 'matched', 'confidence': confidence, 'strength': strength,
                 'scope': 'bridge_base_texture'}
